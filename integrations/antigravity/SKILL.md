@@ -29,7 +29,7 @@ When the user names a specific model, pass `-Model <name>` (or use the model nam
   ```powershell
   & "C:\Users\Vadim\AppData\Local\Programs\Delegator\runtime\ai-delegate.cmd" ask -Model deepseek -PromptFile "$env:TEMP\dg-task.txt" -ContextFile "C:\abs\path\file1.ts"
   ```
-- **Qwen 3.8 Max**:
+- **Qwen 4 Max Preview**:
   ```powershell
   & "C:\Users\Vadim\AppData\Local\Programs\Delegator\runtime\ai-delegate.cmd" ask -Model qwen -PromptFile "$env:TEMP\dg-task.txt" -ContextFile "C:\abs\path\file1.ts"
   ```
@@ -39,11 +39,11 @@ When the user names a specific model, pass `-Model <name>` (or use the model nam
   ```
 
 ### 3. Auto Pool (Hydrogen-First Priority) or Multi-Model Council (`boost`)
-- **Auto (Gemini 4 Hydrogen с автоматическим fallback на GLM, Qwen, DeepSeek)**:
+- **Auto (Gemini 4 Hydrogen с автоматическим fallback на GLM 5.3, Qwen 4 Max Preview, DeepSeek)**:
   ```powershell
   & "C:\Users\Vadim\AppData\Local\Programs\Delegator\runtime\ai-delegate.cmd" assist -CallerModel "antigravity" -PromptFile "$env:TEMP\dg-task.txt"
   ```
-  *По умолчанию запрос всегда направляется в **Gemini 4 Hydrogen**. Пересылка в другие ИИ пула (Z.ai GLM 5.3, Qwen 3.8 Max, DeepSeek) происходит только если Hydrogen не ответил, превысил квоту или временно недоступен.*
+  *По умолчанию запрос всегда направляется в **Gemini 4 Hydrogen**. Пересылка в другие ИИ пула (Z.ai GLM 5.3, Qwen 4 Max Preview, DeepSeek) происходит только если Hydrogen не ответил, превысил квоту или временно недоступен.*
 - **Council (2 сильнейшие веб-модели параллельно + синтез судьёй)**:
   ```powershell
   & "C:\Users\Vadim\AppData\Local\Programs\Delegator\runtime\ai-delegate.cmd" boost -PromptFile "$env:TEMP\dg-task.txt"

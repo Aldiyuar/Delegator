@@ -7,7 +7,7 @@
 
 High-performance IDE delegation tool connecting developer environments (**Google Antigravity, Cursor, VS Code**) to frontier external reasoning models via isolated Chrome DevTools Protocol (CDP) web sessions — **with zero API keys required**.
 
-Redesigned with a native **C# (.NET 8 + WebView2)** client matching Google Antigravity's minimalist dark design, integrated with **Google AI Studio (Gemini 4 Hydrogen)**, **DeepSeek**, **Qwen 3.8 Max**, and **GLM 5.3**.
+Redesigned with a native **C# (.NET 8 + WebView2)** client matching Google Antigravity's minimalist dark design, integrated with **Google AI Studio (Gemini 4 Hydrogen)**, **DeepSeek**, **Qwen 4 Max Preview**, and **GLM 5.3**.
 
 ---
 
@@ -20,13 +20,13 @@ Redesigned with a native **C# (.NET 8 + WebView2)** client matching Google Antig
   - Google Sans & JetBrains Mono typography, status indicators (`● Авторизован`), and clean toggle switches.
 - **Hydrogen-First Priority & Smart Fallback**:
   - All automated delegation calls (`assist`) are routed to **Gemini 4 Hydrogen (Google AI Studio)** as the primary model.
-  - Transparent failover: If Hydrogen hits rate limits, quota exhaustion, or fails to respond, Delegator automatically and gracefully forwards the query to the fallback pool (**GLM 5.3**, **Qwen 3.8 Max**, **DeepSeek**).
+  - Transparent failover: If Hydrogen hits rate limits, quota exhaustion, or fails to respond, Delegator automatically and gracefully forwards the query to the fallback pool (**GLM 5.3**, **Qwen 4 Max Preview**, **DeepSeek**).
 - **Gemini 4 Hydrogen (AI Studio)**:
   - Configured with `Thinking level: High` for maximum reasoning depth.
   - Native file dock context offloading (`-ContextFile`) and support for up to 1M token contexts.
   - Multi-turn session persistence via `-SessionId`.
 - **Strict Mode Direct Targeting**:
-  - Directly invoke individual models: `hydrogen` (or `argon`), `deepseek`, `qwen`, `glm`.
+  - Directly invoke individual models: `hydrogen` (or `argon`), `deepseek`, `qwen` (Qwen 4 Max Preview), `glm`.
   - Guarantees strict execution without silent fallback if the chosen model is unavailable or rate-limited.
 - **Universal Large-Text Offload**:
   - Automatically offloads prompts longer than 15,000 characters into a `00_PROMPT_PAYLOAD.txt` attachment via DataTransfer API on web file inputs.
@@ -177,7 +177,7 @@ Core listens on `http://127.0.0.1:1380`.
 # DeepSeek (code analysis, algorithmic proofs)
 & ".\runtime\ai-delegate.cmd" ask -Model deepseek -Prompt "Optimize this kernel algorithm"
 
-# Qwen 3.8 Max (complex math, combinatorics)
+# Qwen 4 Max Preview (complex math, combinatorics)
 & ".\runtime\ai-delegate.cmd" ask -Model qwen -Prompt "Compute closed-form generating function"
 
 # GLM 5.3 (rapid parallel synthesis)

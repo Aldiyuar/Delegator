@@ -66,7 +66,7 @@
       user: "[class*='user-message'],[class*='chat-user']",
       strip: "[class*='think'],[class*='reasoning']",
       picker: '[aria-label="Select Model"]',
-      models: [/Qwen3\.8-Max/i, /Qwen[\d.]+-Max/i],
+      models: [/Qwen4-Max/i, /Qwen4/i, /Qwen3\.8-Max/i, /Qwen[\d.]+-Max/i],
     },
     deepseek: {
       composer: "textarea",

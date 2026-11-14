@@ -22,11 +22,11 @@ DELEGATOR DIRECT MODEL ROUTING & AUTONOMOUS DELEGATION:
       `& "$env:LOCALAPPDATA\Programs\Delegator\runtime\ai-delegate.cmd" hydrogen -PromptFile "$env:TEMP\dg-task.txt" -ContextFile "C:\path\file1;C:\path\file2"`
     * **DeepSeek**:
       `& "$env:LOCALAPPDATA\Programs\Delegator\runtime\ai-delegate.cmd" ask -Model deepseek -PromptFile "$env:TEMP\dg-task.txt" -ContextFile "C:\path\file1"`
-    * **Qwen 3.8 Max**:
+    * **Qwen 4 Max Preview**:
       `& "$env:LOCALAPPDATA\Programs\Delegator\runtime\ai-delegate.cmd" ask -Model qwen -PromptFile "$env:TEMP\dg-task.txt" -ContextFile "C:\path\file1"`
     * **GLM 5.3 (Z.ai)**:
       `& "$env:LOCALAPPDATA\Programs\Delegator\runtime\ai-delegate.cmd" ask -Model glm -PromptFile "$env:TEMP\dg-task.txt" -ContextFile "C:\path\file1"`
-    * **Auto Pool (Hydrogen-first with automatic fallback to GLM, Qwen, DeepSeek)**:
+    * **Auto Pool (Hydrogen-first with automatic fallback to GLM 5.3, Qwen 4 Max, DeepSeek)**:
       `& "$env:LOCALAPPDATA\Programs\Delegator\runtime\ai-delegate.cmd" assist -CallerModel "antigravity" -PromptFile "$env:TEMP\dg-task.txt"`
 </mcp_and_skills_orchestration>
 ```

@@ -1,6 +1,6 @@
 ﻿param(
     [Parameter(Position = 0)]
-    [ValidateSet("assist", "ask", "delegate", "boost", "improve", "micro", "verify", "plan", "parallel", "ui", "status", "models", "policy", "triage", "extract", "usage", "ping", "hydrogen", "argon", "aistudio", "deepseek", "qwen", "glm", "zai")]
+    [ValidateSet("assist", "ask", "delegate", "boost", "improve", "micro", "verify", "plan", "parallel", "ui", "status", "models", "policy", "triage", "extract", "usage", "ping", "hydrogen", "argon", "aistudio", "deepseek", "qwen", "qwen4", "glm", "zai")]
     [string]$Command = "ask",
 
     [Parameter(Position = 1)]
@@ -3136,7 +3136,7 @@ function Resolve-RequestedWebDoor {
     switch -Regex ($Spec.Trim().ToLowerInvariant()) {
         "^(hydrogen|argon|aistudio|ai-studio|gemini-4-hydrogen|gemini-4-argon|gemini-argon|gemini-hydrogen|gemini-3\.8)$" { return "aistudio" }
         "^(deepseek|ds|deepseek-v3|deepseek-r1|deepseek-v4|r1|v3)$" { return "deepseek" }
-        "^(qwen|qwen3|qwen-3\.8|qwen-max|qwen3\.8|qwen-3\.8-max)$" { return "qwen" }
+        "^(qwen|qwen4|qwen-4|qwen-4-max|qwen4-max|qwen4-max-preview|qwen3|qwen-3\.8|qwen-max|qwen3\.8|qwen-3\.8-max)$" { return "qwen" }
         "^(glm|zai|z\.ai|glm5|glm-5|glm-5\.3)$" { return "zai" }
         default { return "" }
     }
@@ -3147,7 +3147,7 @@ function Get-WebDoorDisplayName {
     switch ($DoorId) {
         "aistudio" { return "Google AI Studio (Gemini 4 Hydrogen)" }
         "deepseek" { return "DeepSeek" }
-        "qwen"     { return "Qwen 3.8 Max" }
+        "qwen"     { return "Qwen 4 Max Preview" }
         "zai"      { return "GLM 5.3 (Z.ai)" }
         default    { return $DoorId }
     }
@@ -4376,6 +4376,7 @@ switch ($Command) {
     "aistudio" { $Model = "aistudio"; Run-Argon }
     "deepseek" { $Model = "deepseek"; Run-Ask }
     "qwen" { $Model = "qwen"; Run-Ask }
+    "qwen4" { $Model = "qwen"; Run-Ask }
     "glm" { $Model = "zai"; Run-Ask }
     "zai" { $Model = "zai"; Run-Ask }
     "ask" { Run-Ask }

@@ -22,6 +22,25 @@
   },
   "models": [
     {
+      "match": "qwen4-max-preview",
+      "dpr": 156,
+      "aa": 78.0,
+      "confidence": "derived",
+      "note": "Qwen4 Max Preview flagship weights"
+    },
+    {
+      "match": "qwen4-max",
+      "dpr": 156,
+      "aa": 78.0,
+      "confidence": "derived"
+    },
+    {
+      "match": "qwen4",
+      "dpr": 154,
+      "aa": 77.0,
+      "confidence": "derived"
+    },
+    {
       "match": "claude-opus-5",
       "dpr": 156,
       "aa": 78.0,
