@@ -1,0 +1,960 @@
+// The driver for the non-Gemini web doors: one signed-in chat tab per site, one turn at a time.
+// Injected by background.js into a tab it opened itself. Selectors live in SITES, and every one of
+// them has a fallback that needs no selector, because these pages change without notice: what is
+// checked is behaviour (the prompt left the composer, a new answer grew and stopped), not structure.
+(() => {
+  const SITES = {
+    aistudio: {
+      modelOpener: "ms-model-selector button,button.model-selector-card",
+      sharedChoice: true,
+      quotaText: /(quota|rate limit|resource.?exhausted|billing|exceeded|upgrade to)/i,
+      composer: "ms-prompt-box textarea,ms-chunk-input textarea,textarea[aria-label]",
+      send: "ms-run-button button,button[aria-label*='Run'],button[type='submit']",
+      answer: "ms-chat-turn:has([data-turn-role='Model']) .turn-content",
+      turn: "ms-chat-turn",
+      thought: "ms-thought-chunk,ms-thought-accordion,.thought-chunk,details.thought-details,[data-test-id*='thought']",
+      thoughtExpand: "ms-thought-chunk mat-expansion-panel-header[aria-expanded='false'],ms-thought-chunk button[aria-expanded='false']",
+      user: "[data-turn-role='User']",
+      strip: "ms-thought-chunk,[class*='thought'],.author-label,[class*='author'],[class*='turn-footer'],ms-chat-turn-options",
+      failure: /^(error\s+)?(an internal error has occurred|failed to generate|something went wrong)/i,
+      // Its Run button says Stop while a turn runs, and says nothing else that a label would show.
+      running: () => {
+        const button = query("ms-run-button button")[0];
+        return Boolean(button) && !/\brun\b/i.test(button.innerText || "");
+      },
+      modelLabel: /^Gemini[\w .-]*$/i,
+    },
+    kimi: {
+      typing: "paste",
+      modelOpener: ".current-model",
+      picker: ".current-model",
+      // K3.1 Pro and K2.8 on a free account answer with a subscription dialog ("Too many people are
+      // chatting"): measured both. Instant is what such an account really gets.
+      models: [/^Instant/i],
+      rows: "button.model-item",
+      composer: ".chat-input-editor",
+      send: ".send-button-container",
+      answer: ".markdown-container",
+      // Kimi renders its reasoning with the same markdown class, and it can come last on the page.
+      notAnswer: ".thinking-container,.toolcall-container,.toolcall-content",
+      thought: ".thinking-container,[class*='think'],[class*='reason']",
+      user: ".segment-user,[class*='user-content'],[class*='user-message']",
+      strip: "[class*='think'],[class*='reason']",
+      modelLabel: /^K\d[\w.]*$/,
+    },
+    zai: {
+      composer: "#chat-input",
+      send: "#send-message-button",
+      sendHidesWhileBusy: true,
+      answer: ".chat-assistant",
+      turn: ".chat-assistant",
+      thought: ".thinking-block,.thinking-chain-container,[class*='thinking-chain'],[class*='thinking-content'],[class*='think-content'],[class*='thinking']",
+      thoughtExpand: ".thinking-chain-container button:has(svg[class*='-rotate-90'])",
+      user: ".chat-user",
+      strip: ".thinking-chain-container,.thinking-block,[class*='thinking']",
+      picker: '[aria-label="Select a model"]',
+      models: [/GLM-5\.3(?![\w-]*flash)/i, /GLM-5(?![\w.-]*flash)/i],
+    },
+    qwen: {
+      composer: "textarea.message-input-textarea",
+      send: '[aria-label="Send"]',
+      answer: ".chat-response-message-right .phase-answer .custom-qwen-markdown,.chat-response-message-right .custom-qwen-markdown,.phase-answer .custom-qwen-markdown,.custom-qwen-markdown",
+      notAnswer: ".qwen-chat-thinking-tool-status-card-wraper,.qwen-chat-thinking-and-sources,[class*='thinking'],[class*='think'],[class*='reasoning']",
+      turn: ".chat-response-message-right,.chat-response-message-render-flow",
+      thought: ".qwen-chat-thinking-and-sources-content-thinking-container,.qwen-chat-thinking-tool-status-card-wraper,[class*='thinking'],[class*='think'],[class*='reasoning']",
+      thoughtExpand: ".qwen-chat-thinking-tool-status-card-wraper .qwen-chat-tool-status-card,.qwen-chat-thinking-status-card-title",
+      user: "[class*='user-message'],[class*='chat-user']",
+      strip: "[class*='think'],[class*='reasoning']",
+      picker: '[aria-label="Select Model"]',
+      models: [/Qwen3\.8-Max/i, /Qwen[\d.]+-Max/i],
+    },
+    deepseek: {
+      composer: "textarea",
+      send: "[role='button'][class*='ds-icon-button'],button[class*='send']",
+      answer: ".ds-assistant-message-main-content,.ds-markdown",
+      notAnswer: ".ds-think-content,[class*='think']",
+      turn: ".ds-message",
+      thought: ".ds-think-content,[class*='think-content'],[class*='think']",
+      user: ".ds-message:not(:has(.ds-markdown))",
+      strip: "[class*='think']",
+      toggles: [/^DeepThink/i],
+    },
+    tencent: {
+      typing: "plain",
+      // The site strips every line break from a sent message, whatever way it was typed: the composer held
+      // 3, the sent message 0. U+2028 survives, and a model reads it as a line break.
+      lineBreak: "\u2028",
+      composer: "textarea.t-textarea__inner",
+      send: "[class*='send']",
+      answer: ".hyc-common-markdown",
+      user: ".agent-chat__bubble--user,[class*='bubble--user']",
+      strip: "[class*='think'],[class*='reason']",
+      modelLabel: /^Hy\d[\w. -]*$/i,
+    },
+    rudder: {
+      composer: "textarea",
+      send: 'button[aria-label="Send"]',
+      answer: "[class*='group/asst'] [class*='prose-th']",
+      user: "[class*='group/user'] .user-text",
+      strip: "[class*='think'],[class*='reason']",
+    },
+  };
+
+  const LOGIN_TEXT = /^(log ?in|sign ?in|sign ?up|войти|вход|登录|注册)$/i;
+  const LIMIT_TEXT = /(rate limit|too many|limit (reached|exceeded)|reached your|usage limit|try again later|upgrade to|лимит|слишком много|次数|频繁|额度|上限)/i;
+  const STOP_LABEL = /^(stop|стоп|停止|останов)/i;
+  const FENCE = "`".repeat(3);
+  // AI Studio's rows carry the model's id. Same choices as the Gemini page, by the shared setting.
+  const STUDIO_MODELS = {
+    hydrogen: /gemini-\d[\w.]*-hydrogen/i,
+    argon: /gemini-\d[\w.]*-argon/i,
+    "3.1-pro": /gemini-3\.1-pro(?!-image)/i,
+    "3.8-flash": /gemini-3\.8-flash(?![\w-])/i,
+    "3.5-flash-lite": /gemini-3\.5-flash-lite(?![\w-])/i,
+  };
+  const STUDIO_LEVELS = { best: /^high/i, high: /^high/i, medium: /^medium/i, low: /^low/i };
+  const STABLE_MS = 7000;
+  const BUSY_CEILING_MS = 30000;
+  // Measured on AI Studio: a page's "Thinking" label stood for 12 s and went back as the whole answer.
+  // A short "answer" that is really the site saying no. Only short text counts: a real answer may discuss limits.
+  const BUSY_TEXT = /(at capacity|over capacity|try again later|switch to another model|too many requests|server is busy|something went wrong|i encountered an error|что-то пошло не так|服务器繁忙|稍后再试)/i;
+  const THINKING_ONLY = /^(thinking|thought process|thoughts|думаю|размышления|思考中?)[\s.…]*$/i;
+  const DEAD_AFTER_MS = 120000;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (element) => Boolean(element && element.getClientRects().length);
+  const labelOf = (element) => (element?.getAttribute?.("aria-label") || element?.innerText || element?.textContent || "").replace(/\s+/g, " ").trim();
+  let aborted = false;
+  let currentDoor = "";
+  // Reported to the Core so a turn that hangs says WHERE it hangs.
+  const phase = (name) => chrome.runtime.sendMessage({ type: "DELEGATOR_DOOR_PHASE", door: currentDoor, phase: name }).catch(() => {});
+
+  function query(selector) {
+    if (!selector) return [];
+    try {
+      return [...document.querySelectorAll(selector)].filter(visible);
+    } catch {
+      return [];
+    }
+  }
+
+  function findComposer(site) {
+    return query(site.composer)[0]
+      || query("textarea,[contenteditable='true'][role='textbox'],[contenteditable='true']")[0]
+      || null;
+  }
+
+  function loginWall() {
+    if (/\/(sign_in|login|signin)/i.test(location.pathname)) return true;
+    return query("a,button,[role='button']").some((element) => LOGIN_TEXT.test(labelOf(element)));
+  }
+
+  function limitNotice() {
+    const notice = query("[role='alert'],[role='status'],[class*='toast'],[class*='notification'],[class*='limit'],[class*='error-message']")
+      .map(labelOf).find((text) => text && LIMIT_TEXT.test(text));
+    return notice ? notice.slice(0, 160) : "";
+  }
+
+  // A dialog that asks for money instead of answering: the turn will never finish behind it.
+  function paywall() {
+    const text = query("[role='dialog'],[class*='modal'],[class*='paywall']")
+      .map(labelOf).find((value) => value && /(upgrade your plan|too many people|subscription|subscribe|paid plan|out of (credits|messages)|подписк)/i.test(value));
+    return text ? text.slice(0, 160) : "";
+  }
+
+  function isGenerating() {
+    return query("button,[role='button']").some((element) => STOP_LABEL.test(element.getAttribute("aria-label") || element.getAttribute("title") || ""))
+      || query("ms-run-button button,[class*='run-button']").some((element) => /^stop\b|останов/i.test((element.innerText || "").trim()))
+      || query("[class*='stop-button'],[class*='stopButton'],[class*='send-button--stop']").length > 0;
+  }
+
+  // The send control enabled while the composer is empty is a stop button, on most sites with no label to
+  // say so. Used as a hint with a ceiling (BUSY_CEILING_MS), because a site may simply leave it enabled.
+  function sendBusy(site) {
+    const composer = findComposer(site);
+    if (composer && composerLength(composer) > 0) return false;
+    const control = query(site.send).at(-1);
+    if (!control && site.sendHidesWhileBusy) return true;
+    const button = control?.closest?.("button,[role='button']") || control;
+    return Boolean(button) && !button.disabled && button.getAttribute("aria-disabled") !== "true"
+      && !/disabled/i.test(String(button.className?.baseVal ?? button.className ?? ""));
+  }
+
+  // innerText flattens the answer: code loses its fences, lists their bullets. Rebuilt from the DOM.
+  function toMarkdown(node) {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent.replace(/\s+/g, " ");
+    if (node.nodeType !== Node.ELEMENT_NODE) return "";
+    const tag = node.tagName.toLowerCase();
+    const editorLines = tag !== "pre" ? node.querySelector?.(":scope > .cm-editor, :scope .cm-content") : null;
+    if (tag === "pre" || (editorLines && !node.querySelector("p,li,h1,h2,h3"))) {
+      // CodeMirror (.cm-line) and Monaco (.view-line, positioned, nbsp for spaces) keep one row per
+      // line; their textContent has no line breaks at all.
+      const monaco = [...node.querySelectorAll(".view-line")]
+        .sort((a, b) => parseFloat(a.style.top || 0) - parseFloat(b.style.top || 0));
+      const lines = monaco.length ? monaco : [...node.querySelectorAll(".cm-line")];
+      const whole = (node.textContent || "").trim();
+      if (!lines.length && /^\$[^\n]*\$$/.test(whole)) return whole;
+      const code = lines.length
+        ? lines.map((line) => line.textContent.replace(/\u00a0/g, " ")).join("\n")
+        : (node.querySelector("code") || node).textContent.replace(/\n+$/, "");
+      const language = node.getAttribute("data-delegator-lang")
+        || node.querySelector("[data-language]")?.getAttribute("data-language")
+        || (node.querySelector("code")?.className.match(/language-([\w+#.-]+)/) || [])[1]
+        || "";
+      return `\n\n${FENCE}${language}\n${code}\n${FENCE}\n\n`;
+    }
+    if (tag === "br") return "\n";
+    if (["script", "style", "button", "svg", "img"].includes(tag)) return "";
+    const inner = [...node.childNodes].map(toMarkdown).join("");
+    if (/^h[1-6]$/.test(tag)) return `\n\n${"#".repeat(Number(tag[1]))} ${inner.trim()}\n\n`;
+    if (tag === "li") return `\n- ${inner.trim()}`;
+    if (tag === "ul" || tag === "ol") return `\n${inner}\n`;
+    if (["p", "div", "table", "blockquote"].includes(tag)) return `\n\n${inner.trim()}\n\n`;
+    if (tag === "tr") return `\n${inner}`;
+    if (tag === "td" || tag === "th") return `| ${inner.trim()} `;
+    if (tag === "strong" || tag === "b") return inner.trim() ? `**${inner.trim()}**` : "";
+    if (tag === "code") return inner.trim() ? `\`${inner.trim()}\`` : "";
+    return inner;
+  }
+
+  const THOUGHT_HEADER_NOISE = /^(?:thoughts?|thinking process|expand to view model thoughts|thought for \d+\s*(?:s|sec|seconds?)|thinking(?:\s*completed)?|deepthink(?:\s*r1)?|размышления|ход мыслей|мышление и поиск|завершено размышление|мысль завершена|думал[а]?\s*\d+\s*(?:с|сек|секунд[ы]?)|глубокое мышление)[\s.:…-]*$/im;
+
+  function cleanMathDom(root) {
+    root.querySelectorAll(".katex").forEach((formula) => {
+      const tex = formula.querySelector("annotation[encoding='application/x-tex'], annotation")?.textContent;
+      if (tex) {
+        formula.replaceWith(document.createTextNode(`$${tex.trim()}$`));
+      } else {
+        formula.querySelectorAll(".katex-mathml, math").forEach((m) => m.remove());
+      }
+    });
+    root.querySelectorAll(".katex-mathml, mjx-assistive-mml, math").forEach((m) => m.remove());
+  }
+
+  function turnScope(site, node) {
+    if (!node) return document.body;
+    if (site.turn) {
+      const matched = node.closest(site.turn);
+      if (matched && (!site.user || !matched.querySelector(site.user))) return matched;
+    }
+    let cur = node;
+    for (let i = 0; i < 6 && cur.parentElement && cur.parentElement !== document.body; i++) {
+      const parent = cur.parentElement;
+      if (site.user && parent.querySelector(site.user)) break;
+      cur = parent;
+    }
+    return cur;
+  }
+
+  async function expandThoughtsIfNeeded(site, node, anchor = null) {
+    const scope = node ? turnScope(site, node) : document.body;
+    scope.querySelectorAll("details:not([open])").forEach((d) => {
+      if (anchor && anchor.isConnected && !(anchor.compareDocumentPosition(d) & Node.DOCUMENT_POSITION_FOLLOWING)) return;
+      d.open = true;
+    });
+    if (site.thoughtExpand) {
+      const triggers = [...scope.querySelectorAll(site.thoughtExpand)].filter((el) => {
+        if (!visible(el)) return false;
+        if (anchor && anchor.isConnected && !(anchor.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+        return true;
+      });
+      let clicked = false;
+      for (const tr of triggers) {
+        if (currentDoor === "qwen") {
+          const drawer = document.querySelector(".qwen-chat-thinking-and-sources-content-thinking-container");
+          if (drawer && visible(drawer) && (drawer.innerText || "").trim().length > 20) continue;
+        }
+        try {
+          tr.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+          clicked = true;
+          if (currentDoor === "qwen") break;
+        } catch {}
+      }
+      if (clicked) await sleep(450);
+    }
+  }
+
+  function extractThoughts(site, node = null, anchor = null) {
+    const selector = site.thought || site.strip;
+    if (!selector) return "";
+    if (currentDoor === "qwen") {
+      const drawer = document.querySelector(".qwen-chat-thinking-and-sources-content-thinking-container");
+      if (drawer && (drawer.innerText || "").trim().length > 0) {
+        const dc = drawer.cloneNode(true);
+        cleanMathDom(dc);
+        dc.querySelectorAll("button,[role='button'],mat-icon,svg,.material-icons,.material-symbols-outlined").forEach((el) => el.remove());
+        const md = toMarkdown(dc)
+          .replace(/[ \t]+\n/g, "\n")
+          .split("\n")
+          .filter((line) => !THOUGHT_HEADER_NOISE.test(line.trim()))
+          .join("\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+        if (md && !THINKING_ONLY.test(md)) return md;
+      }
+    }
+    const scope = node ? turnScope(site, node) : document.body;
+    const rawNodes = [...scope.querySelectorAll(selector)].filter((el) => {
+      if (node && (el === node || el.contains(node))) return false;
+      if (anchor && anchor.isConnected && !(anchor.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+      return true;
+    });
+    if (!rawNodes.length) return "";
+    const outerNodes = rawNodes.filter(
+      (el) => !rawNodes.some((other) => other !== el && other.contains(el))
+    );
+    const chunks = outerNodes.map((tn) => {
+      const tc = tn.cloneNode(true);
+      cleanMathDom(tc);
+      tc.querySelectorAll(
+        "button,[role='button'],summary,mat-expansion-panel-header,.author-label,[class*='author'],[class*='turn-footer'],.qwen-chat-thinking-status-card-title,[class*='code-header'],[class*='code__hd'],[class*='toolbar'],[class*='copy'],mat-icon,svg,.material-icons,.material-symbols-outlined"
+      ).forEach((el) => el.remove());
+      return toMarkdown(tc)
+        .replace(/[ \t]+\n/g, "\n")
+        .split("\n")
+        .filter((line, idx) => !(idx < 2 && THOUGHT_HEADER_NOISE.test(line.trim())))
+        .join("\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    }).filter((t) => t && !THINKING_ONLY.test(t) && !THOUGHT_HEADER_NOISE.test(t));
+    return chunks.join("\n\n").trim();
+  }
+
+  // The last answer on the page, without its thinking panel. A code block with a language header
+  // keeps the language in the fence rather than as a stray first line.
+  function answerText(site, node) {
+    const copy = node.cloneNode(true);
+    if (site.strip) copy.querySelectorAll(site.strip).forEach((element) => element.remove());
+    // KaTeX renders every formula twice (MathML for readers, HTML for the eye): keep its TeX once.
+    cleanMathDom(copy);
+    // A code block's header holds its language: move that onto the code, then the header can go.
+    copy.querySelectorAll("[class*='banner'],[class*='code-header'],[class*='code__hd'],[class*='segment-code-lang']").forEach((header) => {
+      const owner = header.closest("pre") || header.parentElement?.querySelector("pre")
+        || header.closest("[class*='code']")?.querySelector("pre");
+      const language = [...header.querySelectorAll("*"), header]
+        .filter((element) => element.children.length === 0)
+        .map((element) => (element.textContent || "").trim().toLowerCase())
+        .find((text) => /^[a-z][\w+#.-]{0,19}$/.test(text) && !/^(copy|download|run|edit|复制|下载)$/.test(text));
+      if (owner && language && !owner.getAttribute("data-delegator-lang")) owner.setAttribute("data-delegator-lang", language);
+      header.remove();
+    });
+    // Code viewers put their own chrome inside the answer: line numbers, a language tag, Copy buttons.
+    copy.querySelectorAll("[class*='line-number'],[class*='lineNumber'],[class*='linenumber'],[class*='line-num'],[role='button'],[class*='copy'],[class*='toolbar'],[class*='code-header'],[class*='codeHeader']")
+      .forEach((element) => element.remove());
+    copy.querySelectorAll("[class*='absolute']").forEach((element) => {
+      if (element.nextElementSibling && /^[\w+#.-]{1,20}$/.test((element.textContent || "").trim())) element.remove();
+    });
+    const bodyMd = toMarkdown(copy).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    if (!bodyMd) return "";
+    return bodyMd;
+  }
+
+  // The answer node: the site's own selector, which names the assistant's side only. Text is not a
+  // filter here: "2+2" is a fair prompt, and "2+2 = 4" contains it.
+  function lastAnswer(site) {
+    const nodes = query(site.answer).filter((element) => !site.notAnswer || !element.closest(site.notAnswer));
+    // Outermost only: a broad selector also matches parts of the answer (a code block's own markdown
+    // class), and the last of those would stand in for the whole answer.
+    const outer = nodes.filter((element) => !nodes.some((other) => other !== element && other.contains(element)));
+    return outer.at(-1) || null;
+  }
+
+  async function trusted(action, details = {}) {
+    const result = await chrome.runtime.sendMessage({ type: "DELEGATOR_DOOR_DEBUGGER", action, ...details });
+    if (result?.error) throw new Error(result.error);
+    return result;
+  }
+
+  // What is on the page, for an error that says more than "it failed". Structure only, and the prompt's
+  // own text is never included: classes, counts and lengths.
+  function pageFacts(site, promptHead) {
+    const describe = (element) => `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ""}.${String(element.className?.baseVal ?? element.className ?? "").trim().split(/\s+/).slice(0, 3).join(".")}`;
+    const composer = findComposer(site);
+    const facts = [
+      `url ${location.pathname}`,
+      `окно ${window.innerWidth}x${window.innerHeight}`,
+      `видимость ${document.visibilityState}`,
+      `поле ${composer ? `${describe(composer)}:${composerLength(composer)}` : "нет"}`,
+      `вход ${loginWall() ? "просит" : "нет"}`,
+      `ответ(${site.answer}) ${query(site.answer).length}`,
+      `пользователь ${query(site.user).length}`,
+      `генерирует ${isGenerating()}`,
+      `диалоги ${query("[role='dialog'],[class*='modal'],[class*='dialog'],[class*='paywall'],[class*='upgrade']").map((element) => (element.innerText || "").replace(/\s+/g, " ").slice(0, 70)).filter(Boolean).slice(0, 3).join(" / ") || "нет"}`,
+    ];
+    const bubble = promptHead && [...document.querySelectorAll("body *")].reverse()
+      .find((element) => element.children.length <= 2 && (element.textContent || "").includes(promptHead) && element !== composer);
+    if (bubble) {
+      let holder = bubble;
+      while (holder.parentElement && holder.parentElement !== document.body && holder.parentElement.children.length < 2) holder = holder.parentElement;
+      let list = holder.parentElement;
+      for (let up = 0; up < 4 && list?.parentElement && list.children.length < 2; up++) list = list.parentElement;
+      const rows = [...(list?.children || [])].slice(-5).map((element) => `${describe(element)}:${(element.textContent || "").length}`);
+      facts.push(`пузырь ${describe(bubble)}`, `рядом ${rows.join(" | ")}`);
+    } else {
+      facts.push("пузыря с запросом нет");
+    }
+    const buttons = query("button,[role='button']").map(labelOf).filter(Boolean).slice(-8).map((text) => text.slice(0, 24));
+    facts.push(`кнопки ${buttons.join(" | ")}`);
+    return facts.join("; ").slice(0, 1400);
+  }
+
+  function setComposerText(composer, text) {
+    composer.focus();
+    if (composer.tagName === "TEXTAREA" || composer.tagName === "INPUT") {
+      const prototype = composer.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(prototype, "value").set.call(composer, text);
+      composer.dispatchEvent(new Event("input", { bubbles: true }));
+      return;
+    }
+    document.execCommand("insertText", false, text);
+  }
+
+  const composerLength = (composer) => (composer?.value ?? composer?.innerText ?? "").trim().length;
+
+  // Text with its line breaks: Kimi's editor flattened them under execCommand and Tencent's page under a
+  // value set from outside, and the model then saw one long line (measured: LINES=1 for three lines).
+  async function typePrompt(site, text) {
+    const composer = findComposer(site);
+    if (!composer) throw new Error("На странице нет поля ввода.");
+    composer.focus();
+    const settled = async (ms) => {
+      const until = Date.now() + ms;
+      while (composerLength(composer) === 0 && Date.now() < until) await sleep(100);
+      return composerLength(composer) > 0;
+    };
+    const paste = () => {
+      const transfer = new DataTransfer();
+      transfer.setData("text/plain", text);
+      composer.dispatchEvent(new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }));
+    };
+    const viaDebugger = async () => {
+      await trusted("begin");
+      composer.focus();
+      await trusted("text", { text });
+    };
+    const ways = {
+      paste: [paste, viaDebugger],
+      trusted: [viaDebugger, () => setComposerText(composer, text)],
+      plain: [() => setComposerText(composer, text), paste, viaDebugger],
+    }[site.typing || "plain"];
+    for (const way of ways) {
+      await way();
+      if (await settled(1500 + Math.min(text.length / 8, 15000))) return composer;
+    }
+    throw new Error("Страница не приняла текст запроса.");
+  }
+
+  async function pressSend(site, composer, promptHead, text) {
+    // A prompt counts as sent once the page shows it. An empty composer alone proves nothing: a page that
+    // hydrates late wipes the text it was given, and that looked like a send followed by a dead model.
+    const wasSent = () => composerLength(findComposer(site)) === 0
+      && (document.body.textContent || "").includes(promptHead);
+    const refill = async () => {
+      const current = findComposer(site);
+      if (current && composerLength(current) === 0) {
+        setComposerText(current, text);
+        await sleep(400);
+      }
+    };
+    const patience = 3000 + Math.min(text.length / 8, 15000);
+    const waitSent = async () => {
+      const until = Date.now() + patience;
+      while (Date.now() < until) {
+        if (wasSent()) return true;
+        if ((isGenerating() || site.running?.()) && composerLength(findComposer(site)) === 0) return true;
+        await sleep(150);
+      }
+      return false;
+    };
+    const button = () => {
+      const candidate = query(site.send).at(-1) || null;
+      return candidate?.closest?.("button,[role='button']") || candidate;
+    };
+    const until = Date.now() + 5000;
+    while (Date.now() < until) {
+      const current = button();
+      if (current && !current.disabled && current.getAttribute("aria-disabled") !== "true") break;
+      await sleep(100);
+    }
+    button()?.click();
+    if (await waitSent()) return;
+    await refill();
+    composer.focus();
+    composer.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+    if (await waitSent()) return;
+    // The page ignores untrusted input: the same keys and clicks through the debugger.
+    await trusted("begin");
+    await refill();
+    const target = button();
+    if (target) {
+      const rect = target.getBoundingClientRect();
+      await trusted("click", { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+      if (await waitSent()) return;
+    }
+    composer.focus();
+    await trusted("key", { key: "Enter" });
+    if (await waitSent()) return;
+    if (paywall()) throw new Error(`QUOTA: ${paywall()}`);
+    if (loginWall()) throw new Error(`LOGIN: сайт просит войти. ${pageFacts(site, promptHead)}`);
+    throw new Error(`Страница не приняла запрос: ни кнопка, ни Enter его не отправили. ${pageFacts(site, promptHead)}`);
+  }
+
+  let menuSeen = "";
+
+  function menuRows() {
+    const rows = query("[role='menuitem'],[role='menuitemradio'],[role='option'],[data-menu-item]");
+    if (rows.length) return rows;
+    return query("[role='menu'] button,[role='listbox'] button,[data-menu-content] button,[data-dropdown-menu-content] button,[data-menu-content] [class*='item']");
+  }
+
+  async function trustedClickOn(element) {
+    const rect = element.getBoundingClientRect();
+    await trusted("click", { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+  }
+
+  function openMenu(element) {
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
+      element.dispatchEvent(new (type.startsWith("pointer") ? PointerEvent : MouseEvent)(type, { bubbles: true, cancelable: true, button: 0 }));
+    }
+    element.click();
+  }
+
+  // The strongest model the page offers. Never a reason to fail: the page's default still answers,
+  // and the reply reports what really ran.
+  async function chooseModel(site) {
+    if (!site.picker || !site.models?.length) return;
+    // The picker renders after the composer does, later still in a background tab.
+    const until = Date.now() + 5000;
+    while (!query(site.picker).length && Date.now() < until) await sleep(150);
+    const pickerText = () => (query(site.picker)[0]?.innerText || "").replace(/\s+/g, " ").trim();
+    const rowText = (element) => (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+    const rowsOf = () => (site.rows ? query(site.rows) : menuRows());
+    if (!query(site.picker).length || site.models[0].test(pickerText())) return;
+    for (const pattern of site.models) {
+      if (pattern.test(pickerText())) return;
+      if (!rowsOf().length) {
+        openMenu(query(site.picker)[0]);
+        await sleep(600);
+      }
+      if (!rowsOf().length) {
+        await trustedClickOn(query(site.picker)[0]).catch(() => {});
+        await sleep(800);
+      }
+      const rows = rowsOf();
+      menuSeen = rows.map(rowText).map((text) => text.slice(0, 40)).slice(0, 12).join(" | ");
+      const row = rows.find((element) => pattern.test(rowText(element)));
+      if (!row) continue;
+      row.click();
+      await sleep(400);
+      if (!pattern.test(pickerText())) {
+        await trustedClickOn(row).catch(() => {});
+        await sleep(400);
+      }
+      if (pattern.test(pickerText())) return;
+      await trusted("key", { key: "Escape" }).catch(() => {});
+      await sleep(300);
+    }
+    if (rowsOf().length) {
+      await trusted("key", { key: "Escape" }).catch(() => {});
+      await sleep(200);
+    }
+  }
+
+  // Model and thinking level by the choice shared with Gemini. A model the page does not offer is the
+  // core's business (next rung); a level it does not offer is not worth failing a turn for.
+  async function chooseStudioModel(site, task) {
+    const requestedModel = task.model || "hydrogen";
+    const pattern = STUDIO_MODELS[requestedModel] || STUDIO_MODELS.hydrogen;
+    if (!pattern) return "";
+    const cardOf = () => query(site.modelOpener)[0];
+    const card = cardOf();
+    if (!card) throw new Error(`UNAVAILABLE: в AI Studio нет выбора модели. ${pageFacts(site, "")}`);
+    if (!pattern.test(card.innerText || "")) {
+      openMenu(card);
+      await sleep(800);
+      const rows = query("ms-model-carousel-row, .model-carousel-row, button.model-row");
+      const row = rows.find((element) => pattern.test(element.innerText || ""));
+      if (!row) {
+        await trusted("key", { key: "Escape" }).catch(() => {});
+        throw new Error(`UNAVAILABLE: в AI Studio нет модели ${requestedModel}.`);
+      }
+      (row.querySelector("button") || row).click();
+      await sleep(600);
+      if (!pattern.test(cardOf()?.innerText || "")) {
+        await trustedClickOn(row).catch(() => {});
+        await sleep(600);
+      }
+      if (!pattern.test(cardOf()?.innerText || "")) {
+        throw new Error(`UNAVAILABLE: AI Studio не переключился на модель ${requestedModel}.`);
+      }
+    }
+    const level = STUDIO_LEVELS[task.reasoning] || STUDIO_LEVELS.high;
+    const select = query("mat-select[aria-label='Thinking Level'],ms-thinking-level-setting mat-select,mat-select[aria-label*='Thinking']")[0];
+    if (level && select && !level.test((select.innerText || "").trim())) {
+      openMenu(select);
+      await sleep(400);
+      const option = query("mat-option,[role='option']").find((element) => level.test((element.innerText || "").trim()));
+      if (option) option.click();
+      else await trusted("key", { key: "Escape" }).catch(() => {});
+      await sleep(300);
+    }
+    const name = (cardOf()?.innerText || "").split("\n")[0].trim();
+    const shown = (query("mat-select[aria-label='Thinking Level'],ms-thinking-level-setting mat-select")[0]?.innerText || "").trim();
+    return [name, shown].filter(Boolean).join(" · ");
+  }
+
+  async function chooseToggles(site) {
+    for (const pattern of site.toggles || []) {
+      const toggle = query("button,[role='button']").find((element) => pattern.test(labelOf(element)));
+      if (!toggle) continue;
+      const pressed = toggle.getAttribute("aria-pressed") === "true"
+        || /selected|active|checked/i.test(toggle.className || "");
+      if (!pressed) toggle.click();
+      await sleep(200);
+    }
+  }
+
+  function usedLabel(site, doorLabel) {
+    const picker = query(site.picker)[0];
+    const text = picker ? (picker.innerText || "").replace(/\s+/g, " ").trim() : "";
+    if (text) return text;
+    if (site.modelLabel) {
+      const leaf = query("span,div,button").find((element) => element.children.length === 0 && site.modelLabel.test((element.textContent || "").trim()));
+      if (leaf) return leaf.textContent.trim();
+    }
+    return doorLabel;
+  }
+
+  // The deepest shown element holding the prompt: what the page says was sent.
+  function promptOnPage(promptHead) {
+    if (!promptHead) return null;
+    return [...document.querySelectorAll("body *")].reverse()
+      .find((element) => visible(element) && !["SCRIPT", "STYLE", "TEXTAREA", "NOSCRIPT"].includes(element.tagName)
+        && !element.isContentEditable && (element.textContent || "").includes(promptHead)) || null;
+  }
+
+  async function waitForAnswer(site, promptHead, maxWaitMs, prompt, anchor = null) {
+    const started = Date.now();
+    const deadline = turnStartedAt + Math.min(Math.max(Number(maxWaitMs) || 360000, 60000), 900000);
+    let lifeAt = Date.now();
+    const observer = new MutationObserver(() => { lifeAt = Date.now(); });
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+    let best = "";
+    let bestThoughts = "";
+    let changedAt = Date.now();
+    let wallSince = 0;
+    let beatAt = Date.now();
+    const quietNow = () => Date.now() - lifeAt;
+    const formatOutput = async (bodyMd) => {
+      const foundFinal = lastAnswer(site);
+      const finalNode = foundFinal && (!anchor || !anchor.isConnected || (anchor.compareDocumentPosition(foundFinal) & Node.DOCUMENT_POSITION_FOLLOWING)) ? foundFinal : null;
+      await expandThoughtsIfNeeded(site, finalNode, anchor);
+      const finalThoughts = extractThoughts(site, finalNode, anchor);
+      if (finalThoughts.length >= bestThoughts.length) {
+        bestThoughts = finalThoughts;
+      }
+      return bestThoughts
+        ? `[THOUGHTS]\n${bestThoughts}\n\n[RESPONSE]\n${bodyMd}`
+        : `[RESPONSE]\n${bodyMd}`;
+    };
+    try {
+      while (Date.now() < deadline) {
+        if (aborted) throw new Error("ABORTED: другая дверь ответила раньше.");
+        const thinking = query("button,[role='button'],span").some((element) => element.children.length === 0 && /^(thinking|думает|思考中)[\s.…]*$/i.test((element.textContent || "").trim()));
+        if (thinking) lifeAt = Date.now();
+        const found = lastAnswer(site);
+        // Given an anchor, an answer from before it is another turn's, whatever it says.
+        const node = found && (!anchor || !anchor.isConnected || (anchor.compareDocumentPosition(found) & Node.DOCUMENT_POSITION_FOLLOWING)) ? found : null;
+        const liveThoughts = extractThoughts(site, node, anchor);
+        if (liveThoughts.length >= bestThoughts.length) {
+          if (liveThoughts !== bestThoughts) lifeAt = Date.now();
+          bestThoughts = liveThoughts;
+        }
+        const raw = node ? answerText(site, node) : "";
+        const text = THINKING_ONLY.test(raw) || raw === prompt ? "" : raw;
+        if (text !== best) {
+          best = text;
+          changedAt = Date.now();
+        }
+        if (!best) {
+          if (loginWall()) {
+            wallSince = wallSince || Date.now();
+            if (Date.now() - wallSince >= 3000) throw new Error(`LOGIN: сайт просит войти. ${pageFacts(site, promptHead)}`);
+          } else {
+            wallSince = 0;
+          }
+          // Some sites keep Retry beside the user's message at all times, so only a page gone still counts.
+          if (Date.now() - lifeAt > 60000 && query("button,[role='button']").some((element) => /^(повторить|retry|try again|regenerate)$/i.test(labelOf(element)))) {
+            throw new Error(`SLOW: сайт предлагает повторить запрос. ${pageFacts(site, promptHead)}`);
+          }
+          const notice = limitNotice() || paywall();
+          if (notice) throw new Error(`QUOTA: ${notice}`);
+        }
+        if (best && site.failure?.test(best)) throw new Error(`Сайт вернул ошибку: ${best.slice(0, 200)}`);
+        if (best && best.length < 300 && BUSY_TEXT.test(best)) throw new Error(`SLOW: сайт занят: ${best.slice(0, 200)}`);
+        if (best && sendBusy(site)) busySeen = true;
+        if (Date.now() - beatAt >= 15000) {
+          beatAt = Date.now();
+          void phase(`жду ответ: ${best.length} симв., тишина ${Math.round(quietNow() / 1000)} с; ${pageFacts(site, promptHead).slice(0, 260)}`);
+        }
+        if (best && !generatingSeen) {
+          generatingSeen = query("button,[role='button'],ms-run-button button").slice(-10).map(controlShape).join(" | ").slice(0, 1200);
+        }
+        const quiet = Date.now() - changedAt;
+        // A one-word answer gets a longer look: it may be the first word of a slow stream.
+        const needed = best.length < 40 ? STABLE_MS * 2 : STABLE_MS;
+        if (best && site.quotaText?.test(best) && best.length < 400) throw new Error(`QUOTA: ${best.slice(0, 200)}`);
+        const stopped = !isGenerating() && !site.running?.() && !thinking;
+        if (best && quiet >= needed && stopped && (!sendBusy(site) || quiet >= BUSY_CEILING_MS)) return await formatOutput(best);
+        // A page that says it is thinking is alive, however still it sits: GLM-5.3 thought for over two
+        // minutes with nothing moving. The race's own hedge covers the wait.
+        if (Date.now() - lifeAt >= DEAD_AFTER_MS) {
+          if (best) return await formatOutput(best);
+          throw new Error(`SLOW: нет признаков жизни ${Math.round(DEAD_AFTER_MS / 1000)} с. ${pageFacts(site, promptHead)}`);
+        }
+        await sleep(500);
+      }
+      if (best) return await formatOutput(best);
+      throw new Error(`SLOW: нет ответа за ${Math.round((Date.now() - started) / 1000)} с. ${pageFacts(site, promptHead)}`);
+    } finally {
+      observer.disconnect();
+    }
+  }
+
+  // A site renders its guest header for a moment while it reads the session, and the composer appears
+  // later still in a background tab. So a login wall counts only once it has stood for a while, and the
+  // page is ready once a composer has stood without one.
+  async function waitReady(site) {
+    const by = Date.now() + 30000;
+    let wallSince = 0;
+    let clearSince = 0;
+    while (Date.now() < by) {
+      const composer = findComposer(site);
+      if (loginWall()) {
+        clearSince = 0;
+        wallSince = wallSince || Date.now();
+        if (Date.now() - wallSince >= 8000) throw new Error(`LOGIN: сайт просит войти. ${pageFacts(site, "")}`);
+      } else {
+        wallSince = 0;
+        if (composer) {
+          clearSince = clearSince || Date.now();
+          if (Date.now() - clearSince >= 1200) return;
+        } else {
+          clearSince = 0;
+        }
+      }
+      await sleep(250);
+    }
+    throw new Error(`На странице не появилось поле ввода. ${pageFacts(site, "")}`);
+  }
+
+  let generatingSeen = "";
+  let linesTyped = -1;
+  let turnStartedAt = Date.now();
+  let busySeen = false;
+
+  // How the page itself shows the prompt it took, line breaks included.
+  function bubbleShape(promptHead) {
+    const bubble = [...document.querySelectorAll("body *")].reverse()
+      .find((element) => element.children.length <= 3 && !["SCRIPT", "STYLE", "TEXTAREA"].includes(element.tagName) && (element.textContent || "").includes(promptHead));
+    if (!bubble) return "нет";
+    return `${bubble.tagName.toLowerCase()}.${String(bubble.className).slice(0, 40)} ws=${getComputedStyle(bubble).whiteSpace} ${JSON.stringify(bubble.outerHTML.slice(0, 260))}`;
+  }
+
+  function controlShape(element) {
+    return `${element.tagName.toLowerCase()}.${String(element.className?.baseVal ?? element.className ?? "").trim().split(/\s+/).slice(0, 3).join(".").slice(0, 50)}[${(element.getAttribute("aria-label") || "").slice(0, 30)}]"${(element.innerText || "").replace(/\s+/g, " ").trim().slice(0, 40)}"`;
+  }
+
+  // For a door that has no picker in SITES yet: what near the composer looks like one, and what opens.
+  async function probeControls(site) {
+    // The picker renders after the composer does, later still in a background tab.
+    const until = Date.now() + 5000;
+    while (site.modelOpener && !query(site.modelOpener).length && Date.now() < until) await sleep(150);
+    const hint = /model|thinking|reason|level|mode|effort|expert|deep/i;
+    const lines = query("button,[role='button'],[role='combobox'],mat-select,ms-model-selector,ms-thinking-level-setting,[class*='model'],[class*='Model'],[class*='current']")
+      .filter((element) => hint.test(`${element.tagName} ${element.className} ${element.getAttribute("aria-label") || ""}`))
+      .slice(0, 14).map(controlShape);
+    const composer = findComposer(site);
+    let area = composer;
+    for (let up = 0; up < 5 && area?.parentElement; up++) area = area.parentElement;
+    if (area) {
+      lines.push(`NEAR COMPOSER ${[...area.querySelectorAll("button,[role='button'],[role='switch'],[role='radio'],[role='tab'],[role='combobox']")].filter(visible).map(controlShape).slice(0, 12).join(" | ")}`);
+    }
+    lines.push(`WITH TEXT ${query("button,[role='button'],[role='switch'],[role='radio'],[role='tab'],label")
+      .filter((element) => (element.innerText || "").trim().length > 1 && (element.innerText || "").trim().length < 30)
+      .map((element) => `${String(element.className || "").split(/\s+/)[0].slice(0, 24)}"${element.innerText.trim().replace(/\s+/g, " ")}"`).slice(-16).join(" | ")}`);
+    const opener = query(site.modelOpener || "")[0];
+    if (opener) {
+      openMenu(opener);
+      await sleep(900);
+      const rows = query("[role='option'],[role='menuitem'],[role='menuitemradio'],[role='radio'],[role='listitem'],ms-model-carousel-row,button[class*='model'],[class*='model-item'],[class*='models-'] [class*='item'],[class*='dropdown'] [class*='item'],[class*='popover'] [class*='item']")
+        .slice(0, 24).map(controlShape);
+      lines.push(`OPENED ${controlShape(opener)}`, ...rows);
+      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
+      await trusted("key", { key: "Escape" }).catch(() => {});
+      await sleep(400);
+    }
+    return lines.join("\n");
+  }
+
+  // For checking a site by hand when its markup changes (`debug` on /api/web/ask): the shape of the
+  // answer as tags, classes and lengths, with text only for the short labels that give a toolbar away.
+  function answerSkeleton(site, promptHead) {
+    const node = lastAnswer(site);
+    const lines = [
+      `picker ${query(site.picker)[0]?.innerText?.replace(/\s+/g, " ").slice(0, 60) || "нет"}; menu ${menuSeen || "нет"}`,
+      `buttons ${query("button,[role='button']").map(labelOf).filter(Boolean).map((text) => text.slice(0, 24)).slice(-14).join(" | ")}`,
+    ];
+    if (!node) return `${lines[0]}\nno answer node; ${pageFacts(site, promptHead)}`;
+    let up = node;
+    for (let depth = 0; depth < 4 && up.parentElement; depth++) up = up.parentElement;
+    const walk = (element, depth) => {
+      if (lines.length > 90 || depth > 12) return;
+      const name = `${element.tagName.toLowerCase()}.${String(element.className?.baseVal ?? element.className ?? "").trim().split(/\s+/).slice(0, 3).join(".").slice(0, 60)}`;
+      const length = (element.textContent || "").length;
+      const label = element.children.length === 0 && length > 0 && length <= 16 ? ` "${element.textContent.trim()}"` : "";
+      const role = element.getAttribute("role") ? ` role=${element.getAttribute("role")}` : "";
+      lines.push(`${" ".repeat(depth)}${element === node ? "*" : ""}${name}${role} ${length}${label}`);
+      if (element.tagName.toLowerCase() !== "svg") [...element.children].forEach((child) => walk(child, depth + 1));
+    };
+    walk(up, 0);
+    return lines.join("\n");
+  }
+
+  // A site may reopen the last conversation at its front page, and a turn must not continue it: the
+  // old text would become context for the task, and the task would land in someone's own thread.
+  async function ensureFreshChat(site) {
+    if (!query(site.answer).length && !query(site.user).length) return;
+    const isNew = (element) => /^(new chat|новый чат|new conversation|开启新对话|新建对话|新对话)/i.test(labelOf(element));
+    const button = query("a,button,[role='button']").find(isNew);
+    if (!button) throw new Error(`Сайт открыл старый чат, а кнопки нового чата нет. ${pageFacts(site, "")}`);
+    button.click();
+    const until = Date.now() + 8000;
+    while (Date.now() < until) {
+      if (!query(site.answer).length && !query(site.user).length && findComposer(site)) return;
+      await sleep(200);
+    }
+    await trustedClickOn(button).catch(() => {});
+    const retry = Date.now() + 5000;
+    while (Date.now() < retry) {
+      if (!query(site.answer).length && !query(site.user).length && findComposer(site)) return;
+      await sleep(200);
+    }
+    throw new Error(`Новый чат не открылся. ${pageFacts(site, "")}`);
+  }
+
+  async function attachFilesToSite(site, files) {
+    if (!files || !files.length) return;
+    for (const file of files) {
+      try {
+        void phase(`прикрепляю ${file.name}`);
+        let fileInput = query("input[type='file']").find((el) => !el.disabled);
+        if (!fileInput) {
+          const attachBtn = query("button,[role='button'],label").find((b) => {
+            const label = (b.getAttribute("aria-label") || b.title || b.innerText || "").toLowerCase();
+            return /upload|attach|file|прикрепить|загрузить|добавить|файл|\+|clip/i.test(label)
+              && !/send|stop|run|отправить|останов/i.test(label);
+          });
+          if (attachBtn) {
+            attachBtn.click();
+            await sleep(400);
+            fileInput = query("input[type='file']").find((el) => !el.disabled) || query("input[type='file']")[0];
+          }
+        }
+
+        const bytes = Uint8Array.from(atob(file.data_base64), (c) => c.charCodeAt(0));
+        const fileObj = new File([bytes], file.name, { type: file.mime || "text/plain" });
+        const transfer = new DataTransfer();
+        transfer.items.add(fileObj);
+
+        if (fileInput) {
+          fileInput.files = transfer.files;
+          fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+          fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+        } else {
+          const composer = findComposer(site);
+          if (composer) {
+            composer.dispatchEvent(new DragEvent("dragenter", { bubbles: true, dataTransfer: transfer }));
+            composer.dispatchEvent(new DragEvent("dragover", { bubbles: true, dataTransfer: transfer }));
+            composer.dispatchEvent(new DragEvent("drop", { bubbles: true, dataTransfer: transfer }));
+          }
+        }
+        await sleep(1500);
+      } catch (err) {
+        console.warn("attachFilesToSite error:", err);
+      }
+    }
+  }
+
+  async function runTurn(door, doorLabel, task) {
+    const site = SITES[door];
+    if (!site) throw new Error(`Неизвестный сайт: ${door}.`);
+    aborted = false;
+    currentDoor = door;
+    turnStartedAt = Number(task.startedAt) || Date.now();
+    void phase(task.attempt ? "страница перезагрузилась, продолжаю" : "драйвер запущен");
+    // Focus emulation for the whole turn, as for Gemini: a background page lays out and streams as if
+    // it were in front. Not fatal: a page that does not need it still works.
+    await trusted("begin").catch(() => {});
+    void phase("жду страницу");
+    await waitReady(site);
+    if (task.attempt) {
+      // The page reloaded mid-turn. It shows the prompt: the turn was sent, wait on and take only what
+      // follows it. It does not, though the turn had been sent: the site lost it, and a reply from some
+      // other chat must not pass for this one. Neither: the turn never left, so run it from the start.
+      const raw = String(task.text || "");
+      const line = (site.lineBreak ? raw.replace(/\r?\n/g, site.lineBreak) : raw).trim().split(site.lineBreak || "\n")[0].trim().slice(0, 40);
+      const shownBy = Date.now() + 8000;
+      let shown = promptOnPage(line);
+      while (!shown && Date.now() < shownBy) {
+        await sleep(250);
+        shown = promptOnPage(line);
+      }
+      if (shown) {
+        const resumed = await waitForAnswer(site, line, task.max_wait_ms, raw.trim(), shown);
+        return { text: resumed, used: usedLabel(site, doorLabel) };
+      }
+      if (task.resume) throw new Error(`SLOW: после перезагрузки страницы запроса на ней нет. ${pageFacts(site, line)}`);
+    }
+    await ensureFreshChat(site);
+    void phase("выбор модели");
+    const controls = task.debug ? await probeControls(site) : "";
+    await chooseModel(site);
+    const sharedLabel = site.sharedChoice ? await chooseStudioModel(site, task) : "";
+    await chooseToggles(site);
+    const text = site.lineBreak ? String(task.text || "").replace(/\r?\n/g, site.lineBreak) : String(task.text || "");
+    // The first line only: pages collapse or restyle what follows it.
+    const promptHead = text.trim().split(site.lineBreak || "\n")[0].trim().slice(0, 40);
+    void phase("ввод запроса");
+    const composer = await typePrompt(site, text);
+    linesTyped = ((composer.value ?? composer.innerText ?? "").match(/\n/g) || []).length;
+    if (task.files && task.files.length) {
+      void phase("прикрепляю файлы");
+      await attachFilesToSite(site, task.files);
+    }
+    void phase("отправка");
+    if (paywall()) throw new Error(`QUOTA: ${paywall()}`);
+    await pressSend(site, composer, promptHead, text);
+    void phase("жду ответ");
+    const answer = await waitForAnswer(site, promptHead, task.max_wait_ms, text.trim());
+    const used = sharedLabel || usedLabel(site, doorLabel);
+    return { text: task.debug ? `${answer}\n=== DOM ===\nline breaks in the prompt ${(text.match(/\n/g) || []).length}, in the composer ${linesTyped}, on the page: ${bubbleShape(promptHead)}\n${controls}\n--- busy while generating ${busySeen}, at the end ${sendBusy(site)}\n--- while generating: ${generatingSeen}\n${answerSkeleton(site, promptHead)}` : answer, used };
+  }
+
+  window.__delegatorDoorHandler = (message, _sender, sendResponse) => {
+    if (message?.type === "DELEGATOR_DOOR_ABORT") {
+      aborted = true;
+      query("button,[role='button']").find((element) => STOP_LABEL.test(element.getAttribute("aria-label") || ""))?.click();
+      return false;
+    }
+    if (message?.type !== "DELEGATOR_DOOR_RUN") return false;
+    void runTurn(message.door, message.label, message.task)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ error: error instanceof Error ? error.message : String(error) }));
+    return true;
+  };
+  if (!window.__delegatorDoorLoaded) {
+    window.__delegatorDoorLoaded = true;
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => window.__delegatorDoorHandler(message, sender, sendResponse));
+  }
+})();
