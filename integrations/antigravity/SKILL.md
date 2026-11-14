@@ -38,12 +38,13 @@ When the user names a specific model, pass `-Model <name>` (or use the model nam
   & "C:\Users\Vadim\AppData\Local\Programs\Delegator\runtime\ai-delegate.cmd" ask -Model glm -PromptFile "$env:TEMP\dg-task.txt" -ContextFile "C:\abs\path\file1.ts"
   ```
 
-### 3. Auto Pool or Multi-Model Council (`boost`)
-- **Auto (strongest ready web model)**:
+### 3. Auto Pool (Hydrogen-First Priority) or Multi-Model Council (`boost`)
+- **Auto (Gemini 4 Hydrogen с автоматическим fallback на GLM, Qwen, DeepSeek)**:
   ```powershell
   & "C:\Users\Vadim\AppData\Local\Programs\Delegator\runtime\ai-delegate.cmd" assist -CallerModel "antigravity" -PromptFile "$env:TEMP\dg-task.txt"
   ```
-- **Council (2 strongest web models in parallel + judge synthesis)**:
+  *По умолчанию запрос всегда направляется в **Gemini 4 Hydrogen**. Пересылка в другие ИИ пула (Z.ai GLM 5.3, Qwen 3.8 Max, DeepSeek) происходит только если Hydrogen не ответил, превысил квоту или временно недоступен.*
+- **Council (2 сильнейшие веб-модели параллельно + синтез судьёй)**:
   ```powershell
   & "C:\Users\Vadim\AppData\Local\Programs\Delegator\runtime\ai-delegate.cmd" boost -PromptFile "$env:TEMP\dg-task.txt"
   ```

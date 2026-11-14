@@ -18,6 +18,9 @@ Redesigned with a native **C# (.NET 8 + WebView2)** client matching Google Antig
   - Ultra-dark theme (`#070709` background, `#0B0B0E` surface containers, `#2F71E3` accent, `rgba(255, 255, 255, 0.06)` borders).
   - Custom borderless titlebar (`FormBorderStyle = None`) with Win32 draggable header (`WM_NCLBUTTONDOWN`) and custom min/max/close controls.
   - Google Sans & JetBrains Mono typography, status indicators (`● Авторизован`), and clean toggle switches.
+- **Hydrogen-First Priority & Smart Fallback**:
+  - All automated delegation calls (`assist`) are routed to **Gemini 4 Hydrogen (Google AI Studio)** as the primary model.
+  - Transparent failover: If Hydrogen hits rate limits, quota exhaustion, or fails to respond, Delegator automatically and gracefully forwards the query to the fallback pool (**GLM 5.3**, **Qwen 3.8 Max**, **DeepSeek**).
 - **Gemini 4 Hydrogen (AI Studio)**:
   - Configured with `Thinking level: High` for maximum reasoning depth.
   - Native file dock context offloading (`-ContextFile`) and support for up to 1M token contexts.

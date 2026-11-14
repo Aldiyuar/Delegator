@@ -2998,6 +2998,14 @@ function Run-Assist {
         return
     }
 
+    # Приоритет Hydrogen (Gemini 4 Hydrogen в Google AI Studio):
+    # Все автоматические вызовы assist/delegate по умолчанию направляются в Hydrogen.
+    # Пересылка в другие ИИ (GLM, Qwen, DeepSeek) происходит только если Hydrogen не дал ответа или перегружен.
+    if (-not $script:Boost -and [string]::IsNullOrWhiteSpace($draftText) -and -not $script:HydrogenAttempted) {
+        Run-Argon -FallbackOnFailure
+        return
+    }
+
     # Coding benchmark, Delegator arm: when the user's Web checkbox is on, EVERY
     # assist goes to the web chat, whatever the router would have said. The router
     # may answer `keep` to a strong caller, and a benchmark of "the model boosted by
@@ -3734,11 +3742,25 @@ function Invoke-WebTurn {
             }
             $ask.doors = @($reqWebDoor)
         } elseif (-not $script:Boost) {
-            $poolDoors = @("aistudio", "zai", "qwen", "deepseek")
             $st = Get-WebDoorsState
-            $enabledPool = @($st.doors | Where-Object { $_.enabled -and ($poolDoors -contains $_.id) } | ForEach-Object { [string]$_.id })
-            if ($enabledPool.Count -gt 0) {
-                $ask.doors = $enabledPool
+            if (-not $script:HydrogenAttempted) {
+                $aiStudioDoor = @($st.doors | Where-Object { $_.id -eq "aistudio" -and $_.enabled -and $_.auth -eq "signed_in" -and [int]$_.resting_sec -eq 0 })[0]
+                if ($null -ne $aiStudioDoor) {
+                    $ask.doors = @("aistudio")
+                } else {
+                    [Console]::Error.WriteLine("[Delegator] Hydrogen (AI Studio) временно на паузе. Пересылаем запрос в доступные модели пула...")
+                    $poolDoors = @("zai", "qwen", "deepseek")
+                    $enabledPool = @($st.doors | Where-Object { $_.enabled -and ($poolDoors -contains $_.id) } | ForEach-Object { [string]$_.id })
+                    if ($enabledPool.Count -gt 0) {
+                        $ask.doors = $enabledPool
+                    }
+                }
+            } else {
+                $poolDoors = @("zai", "qwen", "deepseek")
+                $enabledPool = @($st.doors | Where-Object { $_.enabled -and ($poolDoors -contains $_.id) } | ForEach-Object { [string]$_.id })
+                if ($enabledPool.Count -gt 0) {
+                    $ask.doors = $enabledPool
+                }
             }
         }
         if (-not [string]::IsNullOrWhiteSpace($Reasoning)) { $ask.reasoning = $Reasoning }
@@ -3764,6 +3786,40 @@ function Invoke-WebTurn {
         $reqWebDoor = Resolve-RequestedWebDoor $Model
         if (-not [string]::IsNullOrWhiteSpace($reqWebDoor)) {
             [Console]::Error.WriteLine("[Delegator] Строгий режим: запрошенная модель '$(Get-WebDoorDisplayName $reqWebDoor)' сейчас перегружена или недоступна ($why). Автоматическая подмена на другую модель отключена.")
+            Write-DelegateMetric -Stage "web" -Backend "web" -LatencyMs $webSw.ElapsedMilliseconds -Status "failed"
+            return $null
+        }
+
+        # Приоритет Hydrogen: если aistudio не ответил, переключаемся на резервный пул (GLM, Qwen, DeepSeek)
+        if ($ask.doors.Count -eq 1 -and $ask.doors[0] -eq "aistudio") {
+            [Console]::Error.WriteLine("[Delegator] Hydrogen (AI Studio) не дал ответа ($why). Пересылаем задачу в резервные модели пула (GLM, Qwen, DeepSeek)...")
+            $script:HydrogenAttempted = $true
+            $poolDoors = @("zai", "qwen", "deepseek")
+            $st = Get-WebDoorsState
+            $enabledPool = @($st.doors | Where-Object { $_.enabled -and ($poolDoors -contains $_.id) } | ForEach-Object { [string]$_.id })
+            if ($enabledPool.Count -gt 0) {
+                try {
+                    $ask.doors = $enabledPool
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes(($ask | ConvertTo-Json -Compress))
+                    $response = Invoke-WebRequest -Uri "http://127.0.0.1:1380/api/web/ask" -Method Post -Body $bytes `
+                        -ContentType "application/json; charset=utf-8" -TimeoutSec ($Timeout + 40) -UseBasicParsing
+                    $reply = [System.Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray()) | ConvertFrom-Json
+                    $answer = [string]$reply.text
+                    if (-not [string]::IsNullOrWhiteSpace($answer)) {
+                        $used = [string]$reply.model
+                        $script:FinalModel = $used
+                        $script:FinalProvider = "web"
+                        [Console]::Error.WriteLine("[Delegator] Web (Резерв): ответила модель '$used' ($($reply.provider)) за $([math]::Round($webSw.Elapsed.TotalSeconds, 1)) с")
+                        Write-DelegateMetric -Stage "web" -Model $used -Backend "web" -LatencyMs $webSw.ElapsedMilliseconds -Status "ok" -Extra "door=$($reply.door);fallback=true"
+                        Write-ThinkingTrace -ModelName $used -ProviderName ([string]$reply.provider) -DoorName ([string]$reply.door) -ElapsedMs $webSw.ElapsedMilliseconds -RawOutput $answer
+                        return $answer
+                    }
+                } catch {
+                    $why = $_.Exception.Message
+                    if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $why = $_.ErrorDetails.Message }
+                    [Console]::Error.WriteLine("[Delegator] Резервный пул также не ответил: $why")
+                }
+            }
         } else {
             [Console]::Error.WriteLine("[Delegator] Web failed ($why), using the usual models")
         }
@@ -4242,6 +4298,9 @@ function Run-Usage {
 # helpers of the largest script in the product; without it `. ai-delegate.ps1`
 # falls through to the default command ("ask") and makes a network call.
 function Run-Argon {
+    param(
+        [switch]$FallbackOnFailure
+    )
     $argonCli = Join-Path $PSScriptRoot "argon\ask-argon-cli.js"
     if (-not (Test-Path -LiteralPath $argonCli)) {
         Run-Ask
@@ -4249,6 +4308,8 @@ function Run-Argon {
     }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $tmpPromptFile = Join-Path $env:TEMP ("dg-argon-" + [guid]::NewGuid().ToString("N") + ".txt")
+    $failed = $false
+    $failReason = ""
     try {
         [System.IO.File]::WriteAllText($tmpPromptFile, [string]$Prompt, $Utf8NoBom)
         $nodeArgs = @($argonCli, "--prompt-file", $tmpPromptFile, "--timeout", [string]([math]::Max($TimeoutSec, 360)))
@@ -4276,14 +4337,27 @@ function Run-Argon {
             Write-ThinkingTrace -ModelName "gemini-4-hydrogen" -ProviderName "Google AI Studio" -DoorName "aistudio" -ElapsedMs $sw.ElapsedMilliseconds -RawOutput $ans
             Write-Output $ans
             Exit-Delegate 0
+        } else {
+            $failed = $true
+            $failReason = if ($output) { ($output -join " ").Trim() } else { "код выхода $LASTEXITCODE" }
         }
     } catch {
-        [Console]::Error.WriteLine("[Delegator] Ошибка движка Hydrogen: $($_.Exception.Message)")
+        $failed = $true
+        $failReason = $_.Exception.Message
+        [Console]::Error.WriteLine("[Delegator] Ошибка движка Hydrogen: $failReason")
     } finally {
         if (Test-Path -LiteralPath $tmpPromptFile) {
             Remove-Item -LiteralPath $tmpPromptFile -Force -ErrorAction SilentlyContinue
         }
     }
+
+    if ($FallbackOnFailure) {
+        [Console]::Error.WriteLine("[Delegator] Hydrogen (Google AI Studio) не дал ответа ($failReason). Пересылаем задачу в резервные модели пула (GLM, Qwen, DeepSeek)...")
+        $script:HydrogenAttempted = $true
+        Run-Ask
+        return
+    }
+
     [Console]::Error.WriteLine("[Delegator] Строгий режим: запрошенная модель 'Google AI Studio (Gemini 4 Hydrogen)' сейчас недоступна или не ответила. Автоматическая подмена на другую модель отключена.")
     Write-DelegateMetric -Stage "web" -Model "gemini-4-hydrogen" -Backend "web" -LatencyMs $sw.ElapsedMilliseconds -Status "strict-failed" -Extra "door=aistudio"
     Exit-Delegate 1
